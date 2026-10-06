@@ -1,4 +1,4 @@
-"""Find Canadian sofa listings discounted by at least 60% and email the results."""
+"""Find Canadian sectional and modular couch deals and email the results."""
 
 from __future__ import annotations
 
@@ -6,11 +6,14 @@ import re
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from html import escape
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from notify import send_email
 
@@ -22,17 +25,30 @@ MAX_SHOPIFY_PAGES = 20
 SHOPIFY_SOURCES = {
     "The Brick": (
         "https://www.thebrick.com",
-        "/collections/furniture-living-room-sofas/products.json",
+        (
+            "/collections/furniture-living-room-sofas/products.json",
+            "/collections/furniture-living-room-sectionals/products.json",
+        ),
     ),
     "Leon's": (
         "https://www.leons.ca",
-        "/collections/furniture-living-room-sofas/products.json",
+        (
+            "/collections/furniture-living-room-sofas/products.json",
+            "/collections/furniture-living-room-sectionals/products.json",
+        ),
     ),
 }
-IKEA_URL = "https://www.ikea.com/ca/en/cat/sofas-fu003/"
-SOFA_PATTERN = re.compile(
-    r"\b(?:sofas?|couches?|sectionals?|loveseats?|divans?|canap[eé]s?)\b",
-    re.IGNORECASE,
+IKEA_BASE_URL = "https://www.ikea.com/ca/en/"
+IKEA_SOURCES = (
+    (urljoin(IKEA_BASE_URL, "cat/sofas-fu003/"), ""),
+    (urljoin(IKEA_BASE_URL, "cat/sectional-sofas-31786/"), "sectional sofa"),
+)
+SECTIONAL_PATTERN = re.compile(
+    r"\b(?:sectionals?|sectionnels?|sectionnelles?)\b", re.IGNORECASE
+)
+MODULAR_PATTERN = re.compile(r"\b(?:modular|modulaire|modulaires)\b", re.IGNORECASE)
+SOFA_OR_COUCH_PATTERN = re.compile(
+    r"\b(?:sofas?|couch(?:es)?|canap[eé]s?)\b", re.IGNORECASE
 )
 PRICE_PATTERN = re.compile(r"(\d[\d,]*)(?:\s*\.\s*(\d{2}))?")
 
@@ -45,6 +61,17 @@ class Deal:
     sale_price: Decimal
     regular_price: Decimal
     discount_percent: Decimal
+    image_url: str | None = None
+
+
+def _is_target_product(text: str) -> bool:
+    return bool(
+        SECTIONAL_PATTERN.search(text)
+        or (
+            MODULAR_PATTERN.search(text)
+            and SOFA_OR_COUCH_PATTERN.search(text)
+        )
+    )
 
 
 def _decimal_price(value: Any) -> Decimal | None:
@@ -71,10 +98,12 @@ def _make_deal(
     url: str,
     sale_price: Decimal | None,
     regular_price: Decimal | None,
+    image_url: str | None = None,
+    category_hint: str = "",
 ) -> Deal | None:
     if (
         not title
-        or not SOFA_PATTERN.search(title)
+        or not _is_target_product(f"{title} {category_hint}")
         or not url
         or sale_price is None
         or regular_price is None
@@ -89,7 +118,7 @@ def _make_deal(
         return None
 
     discount = discount_amount * 100 / regular_price
-    return Deal(retailer, title, url, sale_price, regular_price, discount)
+    return Deal(retailer, title, url, sale_price, regular_price, discount, image_url)
 
 
 def _shopify_deals(
@@ -101,13 +130,24 @@ def _shopify_deals(
         product_type = str(product.get("product_type") or "")
         raw_tags = product.get("tags") or ""
         tags = " ".join(raw_tags) if isinstance(raw_tags, list) else str(raw_tags)
-        if not SOFA_PATTERN.search(f"{title} {product_type} {tags}"):
+        if not _is_target_product(f"{title} {product_type} {tags}"):
             continue
 
         handle = str(product.get("handle") or "")
         if not handle:
             continue
         product_url = urljoin(base_url, f"/products/{handle}")
+        images = product.get("images") or []
+        first_image = images[0] if images and isinstance(images[0], dict) else {}
+        image_data = product.get("image")
+        if not first_image and isinstance(image_data, dict):
+            first_image = image_data
+        product_image = first_image.get("src") if isinstance(first_image, dict) else None
+        if not product_image and isinstance(image_data, str):
+            product_image = image_data
+        product_image_url = (
+            urljoin(base_url, str(product_image)) if product_image else None
+        )
 
         for variant in product.get("variants", []):
             if not variant.get("available", True):
@@ -122,9 +162,23 @@ def _shopify_deals(
                 and not variant_title.isdigit()
             ):
                 display_title = f"{title} ({variant_title})"
+            variant_image = variant.get("featured_image")
+            if isinstance(variant_image, dict):
+                variant_image = variant_image.get("src")
+            image_url = (
+                urljoin(base_url, str(variant_image))
+                if variant_image
+                else product_image_url
+            )
 
             deal = _make_deal(
-                retailer, display_title, product_url, sale_price, regular_price
+                retailer,
+                display_title,
+                product_url,
+                sale_price,
+                regular_price,
+                image_url,
+                f"{product_type} {tags}",
             )
             if deal is None:
                 continue
@@ -161,7 +215,7 @@ def _shopify_source_deals(
     return _shopify_deals(products, retailer, base_url)
 
 
-def _ikea_card_deal(card: Tag) -> Deal | None:
+def _ikea_card_deal(card: Tag, category_hint: str = "") -> Deal | None:
     title_node = card.select_one(".plp-price-module__product-link")
     if title_node is None:
         return None
@@ -174,7 +228,28 @@ def _ikea_card_deal(card: Tag) -> Deal | None:
     product_link = card.select_one('a[href*="/p/"]')
     if product_link is None:
         return None
-    product_url = urljoin(IKEA_URL, str(product_link.get("href") or ""))
+    product_url = urljoin(IKEA_BASE_URL, str(product_link.get("href") or ""))
+    image_node = card.select_one("img.plp-image")
+    image_url = None
+    if image_node is not None:
+        image_source = image_node.get("src") or image_node.get("data-src")
+        if not image_source and image_node.get("srcset"):
+            image_source = str(image_node["srcset"]).split(",")[-1].strip().split()[0]
+        if image_source:
+            image_url = urljoin(IKEA_BASE_URL, str(image_source))
+            parsed_image_url = urlsplit(image_url)
+            image_query = re.sub(
+                r"(^|&)f=[^&]*", r"\1f=xxl", parsed_image_url.query
+            )
+            image_url = urlunsplit(
+                (
+                    parsed_image_url.scheme,
+                    parsed_image_url.netloc,
+                    parsed_image_url.path,
+                    image_query or parsed_image_url.query,
+                    parsed_image_url.fragment,
+                )
+            )
 
     current_node = card.select_one(".plp-price-module__current-price")
     if current_node is None:
@@ -195,17 +270,27 @@ def _ikea_card_deal(card: Tag) -> Deal | None:
         and price > sale_price
     ]
     regular_price = max(old_prices) if old_prices else None
-    return _make_deal("IKEA Canada", title, product_url, sale_price, regular_price)
+    return _make_deal(
+        "IKEA Canada",
+        title,
+        product_url,
+        sale_price,
+        regular_price,
+        image_url,
+        category_hint,
+    )
 
 
-def _ikea_source_deals(session: requests.Session) -> list[Deal]:
-    response = session.get(IKEA_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+def _ikea_source_deals(
+    session: requests.Session, url: str, category_hint: str = ""
+) -> list[Deal]:
+    response = session.get(url, timeout=REQUEST_TIMEOUT_SECONDS)
     response.raise_for_status()
     soup = BeautifulSoup(response.text, "html.parser")
     return [
         deal
         for card in soup.select(".plp-mastercard")
-        if (deal := _ikea_card_deal(card)) is not None
+        if (deal := _ikea_card_deal(card, category_hint)) is not None
     ]
 
 
@@ -214,36 +299,71 @@ def scrape_deals() -> tuple[list[Deal], list[str], list[str]]:
     session.headers.update(
         {"User-Agent": "SofaMonitor/1.0 (+https://github.com/sidtechno/sofa-monitor)"}
     )
+    retry_policy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        respect_retry_after_header=True,
+    )
+    session.mount("https://", HTTPAdapter(max_retries=retry_policy))
     deals: list[Deal] = []
     checked: list[str] = []
     errors: list[str] = []
 
-    for retailer, (base, endpoint) in SHOPIFY_SOURCES.items():
-        try:
-            deals.extend(
-                _shopify_source_deals(session, retailer, base, endpoint)
-            )
+    for retailer, (base, endpoints) in SHOPIFY_SOURCES.items():
+        retailer_deals: dict[str, Deal] = {}
+        successful_collections = 0
+        for endpoint in endpoints:
+            try:
+                collection_deals = _shopify_source_deals(
+                    session, retailer, base, endpoint
+                )
+                successful_collections += 1
+                for deal in collection_deals:
+                    current = retailer_deals.get(deal.url)
+                    if current is None or deal.discount_percent > current.discount_percent:
+                        retailer_deals[deal.url] = deal
+            except (requests.RequestException, ValueError) as error:
+                errors.append(f"{retailer} ({endpoint}): {error}")
+                print(
+                    f"Scraping failed for {retailer} ({endpoint}): {error}",
+                    file=sys.stderr,
+                )
+        deals.extend(retailer_deals.values())
+        if successful_collections:
             checked.append(retailer)
+
+    successful_ikea_sources = 0
+    for url, category_hint in IKEA_SOURCES:
+        try:
+            deals.extend(_ikea_source_deals(session, url, category_hint))
+            successful_ikea_sources += 1
         except (requests.RequestException, ValueError) as error:
-            errors.append(f"{retailer}: {error}")
-            print(f"Scraping failed for {retailer}: {error}", file=sys.stderr)
-
-    try:
-        deals.extend(_ikea_source_deals(session))
+            errors.append(f"IKEA Canada ({url}): {error}")
+            print(f"Scraping failed for IKEA Canada ({url}): {error}", file=sys.stderr)
+    if successful_ikea_sources:
         checked.append("IKEA Canada")
-    except (requests.RequestException, ValueError) as error:
-        errors.append(f"IKEA Canada: {error}")
-        print(f"Scraping failed for IKEA Canada: {error}", file=sys.stderr)
 
+    unique_deals: dict[tuple[str, str], Deal] = {}
+    for deal in deals:
+        key = (deal.retailer, deal.url)
+        current = unique_deals.get(key)
+        if current is None or deal.discount_percent > current.discount_percent:
+            unique_deals[key] = deal
+
+    deals = list(unique_deals.values())
     deals.sort(key=lambda deal: (-deal.discount_percent, deal.sale_price))
     return deals, checked, errors
 
 
 def _format_email(
     deals: list[Deal], checked: list[str], errors: list[str]
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     if deals:
-        subject = f"Sofa Monitor: {len(deals)} sofa deal(s) at 60%+ off"
+        subject = (
+            f"Sofa Monitor: {len(deals)} sectional/modular deal(s) at 60%+ off"
+        )
         sections = [
             f"{deal.title}\n"
             f"Retailer: {deal.retailer}\n"
@@ -251,12 +371,16 @@ def _format_email(
             f"(regularly ${deal.regular_price:,.2f} CAD)\n"
             f"Discount: {deal.discount_percent:.1f}%\n"
             f"Product: {deal.url}"
+            + (f"\nPhoto: {deal.image_url}" if deal.image_url else "")
             for deal in deals
         ]
         body = "\n\n".join(sections)
     else:
-        subject = "Sofa Monitor: no sofa deals at 60%+ off"
-        body = "No sofa listings with a verified discount of 60% or more were found."
+        subject = "Sofa Monitor: no sectional/modular deals at 60%+ off"
+        body = (
+            "No sectional sofa or modular couch listings with a verified "
+            "discount of 60% or more were found."
+        )
 
     body += "\n\nWebsites checked: " + (", ".join(checked) or "none")
     body += (
@@ -265,13 +389,54 @@ def _format_email(
     )
     if errors:
         body += "\n\nWebsite errors:\n" + "\n".join(f"- {error}" for error in errors)
-    return subject, body
+
+    cards = []
+    for deal in deals:
+        image = ""
+        if deal.image_url:
+            image = (
+                f'<a href="{escape(deal.url, quote=True)}">'
+                f'<img src="{escape(deal.image_url, quote=True)}" '
+                f'alt="{escape(deal.title, quote=True)}" '
+                'style="display:block;max-width:100%;width:360px;height:auto;'
+                'border:0;margin-bottom:12px"></a>'
+            )
+        cards.append(
+            '<div style="border:1px solid #ddd;border-radius:8px;'
+            'padding:16px;margin:0 0 16px">'
+            f"{image}"
+            f'<h2 style="font-size:18px;margin:0 0 8px">'
+            f'<a href="{escape(deal.url, quote=True)}">'
+            f"{escape(deal.title)}</a></h2>"
+            f"<p><strong>{escape(deal.retailer)}</strong><br>"
+            f"Sale price: ${deal.sale_price:,.2f} CAD "
+            f"(regularly ${deal.regular_price:,.2f} CAD)<br>"
+            f"<strong>{deal.discount_percent:.1f}% off</strong></p></div>"
+        )
+
+    html_body = (
+        "<html><body style=\"font-family:Arial,sans-serif;color:#222\">"
+        "<h1>Sectional sofa and modular couch deals</h1>"
+        f'{"".join(cards) if cards else "<p>No qualifying deals found.</p>"}'
+        f"<p>Websites checked: {escape(', '.join(checked) or 'none')}</p>"
+        "<p>These are Canadian online listings. Confirm delivery and stock "
+        "availability for your Quebec postal code with the retailer.</p>"
+        + (
+            "<p><strong>Website errors:</strong><br>"
+            + "<br>".join(escape(error) for error in errors)
+            + "</p>"
+            if errors
+            else ""
+        )
+        + "</body></html>"
+    )
+    return subject, body, html_body
 
 
 def main() -> None:
     deals, checked, errors = scrape_deals()
-    subject, body = _format_email(deals, checked, errors)
-    send_email(subject, body)
+    subject, body, html_body = _format_email(deals, checked, errors)
+    send_email(subject, body, html_body)
 
     if not checked:
         raise RuntimeError("All retailer scrapes failed; see the email for details.")

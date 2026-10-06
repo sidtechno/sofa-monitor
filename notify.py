@@ -6,7 +6,7 @@ import smtplib
 from email.message import EmailMessage
 
 
-def send_email(subject: str, body: str) -> None:
+def send_email(subject: str, body: str, html_body: str | None = None) -> None:
     email_user = os.getenv("EMAIL_USER")
     email_password = os.getenv("EMAIL_PASSWORD")
     email_to = os.getenv("EMAIL_TO")
@@ -30,6 +30,8 @@ def send_email(subject: str, body: str) -> None:
     msg["From"] = email_user
     msg["To"] = email_to
     msg.set_content(body)
+    if html_body is not None:
+        msg.add_alternative(html_body, subtype="html")
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(email_user, email_password)
         smtp.send_message(msg)
