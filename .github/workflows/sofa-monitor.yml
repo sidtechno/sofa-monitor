@@ -17,6 +17,6 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python main.py
         env:
-          EMAIL_USER: "eric.dugal@gmail.com"
-          EMAIL_PASSWORD: "alic iivk mlpd dsaz"
-          EMAIL_TO: "eric.dugal@hotmail.com"
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
