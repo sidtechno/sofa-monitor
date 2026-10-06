@@ -17,7 +17,7 @@ from urllib3.util.retry import Retry
 
 from notify import send_email
 
-DISCOUNT_THRESHOLD = Decimal("60")
+DISCOUNT_THRESHOLD = Decimal("50")
 REQUEST_TIMEOUT_SECONDS = 30
 SHOPIFY_PAGE_SIZE = 250
 MAX_SHOPIFY_PAGES = 20
