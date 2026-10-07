@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from html import escape
 from typing import Any
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup, Tag
@@ -51,6 +52,13 @@ SOFA_OR_COUCH_PATTERN = re.compile(
     r"\b(?:sofas?|couch(?:es)?|canap[eé]s?)\b", re.IGNORECASE
 )
 PRICE_PATTERN = re.compile(r"(\d[\d,]*)(?:\s*\.\s*(\d{2}))?")
+MEUBLES_RD_BASE_URL = "https://www.meublesrd.com"
+MEUBLES_RD_PAGE_URL = (
+    f"{MEUBLES_RD_BASE_URL}/fr/mobilier-salon/sofas-fauteuils/sectionnels"
+)
+MEUBLES_RD_CATEGORY = "Salon /// Sofas & fauteuils"
+MEUBLES_RD_PAGE_SIZE = 100
+MAX_MEUBLES_RD_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -294,6 +302,107 @@ def _ikea_source_deals(
     ]
 
 
+def _meubles_rd_deals(hits: list[dict[str, Any]]) -> list[Deal]:
+    deals: dict[str, Deal] = {}
+    for hit in hits:
+        if str(hit.get("can_add_to_cart") or "").lower() != "yes":
+            continue
+        price = ((hit.get("price") or {}).get("CAD") or {})
+        sale_price = _decimal_price(price.get("default"))
+        discount_amount = _decimal_price(price.get("discount"))
+        if sale_price is None or discount_amount is None:
+            continue
+        sale_price = sale_price.quantize(Decimal("0.01"))
+        regular_price = (sale_price + discount_amount).quantize(Decimal("0.01"))
+        category_hint = " ".join(
+            str(name)
+            for level in (hit.get("categories") or {}).values()
+            for name in level
+        )
+        url = str(hit.get("url") or "")
+        deal = _make_deal(
+            "Meubles RD",
+            str(hit.get("name") or "").strip(),
+            url,
+            sale_price,
+            regular_price,
+            hit.get("image_url") or hit.get("thumbnail_url"),
+            category_hint,
+        )
+        if deal is None:
+            continue
+        current = deals.get(url)
+        if current is None or deal.discount_percent > current.discount_percent:
+            deals[url] = deal
+    return list(deals.values())
+
+
+def _meubles_rd_source_deals(session: requests.Session) -> list[Deal]:
+    # The category page renders products client-side from Algolia, using a
+    # short-lived search key embedded in the page.
+    response = session.get(MEUBLES_RD_PAGE_URL, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+
+    def config_value(name: str) -> str:
+        match = re.search(
+            rf"\\u0022{name}\\u0022\\u003A\\u0022(.*?)\\u0022", response.text
+        )
+        if match is None:
+            raise ValueError(f"Meubles RD search {name} not found")
+        return re.sub(
+            r"\\u([0-9a-fA-F]{4})",
+            lambda m: chr(int(m.group(1), 16)),
+            match.group(1),
+        )
+
+    app_id = config_value("applicationId")
+    api_key = config_value("apiKey")
+    index_name = f"{config_value('baseIndexName')}_products"
+    headers = {
+        "X-Algolia-Application-Id": app_id,
+        "X-Algolia-API-Key": api_key,
+        "Referer": f"{MEUBLES_RD_BASE_URL}/",
+    }
+    facet_filters = json.dumps([[f"categories.level1:{MEUBLES_RD_CATEGORY}"]])
+
+    hits: list[dict[str, Any]] = []
+    for page in range(MAX_MEUBLES_RD_PAGES):
+        search = session.post(
+            f"https://{app_id}-dsn.algolia.net/1/indexes/*/queries",
+            headers=headers,
+            json={
+                "requests": [
+                    {
+                        "indexName": index_name,
+                        "params": urlencode(
+                            {
+                                "query": "",
+                                "hitsPerPage": MEUBLES_RD_PAGE_SIZE,
+                                "page": page,
+                                "facetFilters": facet_filters,
+                            }
+                        ),
+                    }
+                ]
+            },
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        search.raise_for_status()
+        results = search.json().get("results")
+        if not isinstance(results, list) or not results:
+            raise ValueError("Meubles RD returned an unexpected response format")
+        page_hits = results[0].get("hits")
+        if not isinstance(page_hits, list):
+            raise ValueError("Meubles RD returned an unexpected product-list format")
+        hits.extend(item for item in page_hits if isinstance(item, dict))
+        if page + 1 >= int(results[0].get("nbPages") or 0):
+            break
+    else:
+        raise ValueError(f"Meubles RD exceeded the {MAX_MEUBLES_RD_PAGES}-page limit")
+
+    return _meubles_rd_deals(hits)
+
+
 def scrape_deals() -> tuple[list[Deal], list[str], list[str]]:
     session = requests.Session()
     session.headers.update(
@@ -344,6 +453,13 @@ def scrape_deals() -> tuple[list[Deal], list[str], list[str]]:
             print(f"Scraping failed for IKEA Canada ({url}): {error}", file=sys.stderr)
     if successful_ikea_sources:
         checked.append("IKEA Canada")
+
+    try:
+        deals.extend(_meubles_rd_source_deals(session))
+        checked.append("Meubles RD")
+    except (requests.RequestException, ValueError) as error:
+        errors.append(f"Meubles RD: {error}")
+        print(f"Scraping failed for Meubles RD: {error}", file=sys.stderr)
 
     unique_deals: dict[tuple[str, str], Deal] = {}
     for deal in deals:
