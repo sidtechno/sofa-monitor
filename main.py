@@ -1,4 +1,4 @@
-"""Find Canadian sectional and modular couch deals and email the results."""
+﻿"""Find Canadian sectional and modular couch deals and email the results."""
 
 from __future__ import annotations
 
@@ -478,7 +478,7 @@ def _format_email(
 ) -> tuple[str, str, str]:
     if deals:
         subject = (
-            f"Sofa Monitor: {len(deals)} sectional/modular deal(s) at 60%+ off"
+            f"Sofa Monitor: {len(deals)} sectional/modular deal(s) at 50%+ off"
         )
         sections = [
             f"{deal.title}\n"
